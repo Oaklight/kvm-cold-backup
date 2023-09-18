@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# 用户自定义变量
+VM_IMAGE_PATH="/home/kvmadmin/images"
+
+# 函数：显示帮助信息
+show_help() {
+    echo "Usage: $0 [options]"
+    echo "Options:"
+    echo "  -b, --backup <domain> <backup_path>    Backup and package the KVM virtual machine."
+    echo "  -r, --restore <backup_file_path>       Restore the KVM virtual machine from a backup file."
+    echo "  -h, --help                             Show this help message."
+}
+
+# 函数：备份并打包KVM虚拟机镜像
+backup_vm() {
+    local domain="$1"
+    local backup_path="$2"
+    local timestamp=$(date +"%Y%m%d%H%M%S")
+
+    if virsh list --name | grep -q "$domain"; then
+        echo "Stopping virtual machine '$domain'..."
+        virsh shutdown "$domain"
+        while virsh list --name | grep -q "$domain"; do
+            sleep 1
+        done
+
+        echo "Copying virtual machine disk image..."
+        cp "$VM_IMAGE_PATH/$domain.qcow2" "$backup_path/$domain.qcow2"
+
+        echo "Exporting virtual machine configuration..."
+        virsh dumpxml "$domain" > "$backup_path/$domain-$timestamp.xml"
+
+        echo "Starting virtual machine '$domain'..."
+        virsh start "$domain"
+
+        # 使用多线程压缩工具pigz打包
+        echo "Compressing backup files using pigz..."
+        # tar -cf - -C "$backup_path" "$domain-$timestamp.xml" "$domain.qcow2" | pigz -p 4 -9 -c > "$backup_path/$domain-$timestamp.tar.gz"
+        tar -cf - -C "$backup_path" "$domain-$timestamp.xml" "$domain.qcow2" | pv -cN backup | pigz -p 4 -9 -c | pv -cN compress > "$backup_path/$domain-$timestamp.tar.gz"
+
+        rm "$backup_path/$domain-$timestamp.xml" "$backup_path/$domain.qcow2"
+
+        echo "Backup completed. Image saved as '$backup_path/$domain-$timestamp.tar.gz'."
+        
+    else
+        echo "Virtual machine '$domain' does not exist."
+    fi
+}
+
+# 函数：恢复KVM虚拟机镜像（使用多线程解压缩）
+restore_vm() {
+    local backup_file="$1"
+    local domain=$(basename "$backup_file" | cut -d '-' -f 1)
+    local timestamp=$(basename "$backup_file" | cut -d '-' -f 2 | cut -d '.' -f 1)
+
+    # 检查虚拟机是否已存在
+    if virsh list --name | grep -q "$domain"; then
+        echo "Stopping existing virtual machine '$domain'..."
+        virsh shutdown "$domain"
+        while virsh list --name | grep -q "$domain"; do
+            sleep 1
+        done
+    fi
+
+    echo "Restoring backup files using pigz..."
+    pigz -d -c "$backup_file" | tar -x -C "$VM_IMAGE_PATH"
+    virsh define "$VM_IMAGE_PATH/$domain-$timestamp.xml"
+
+    echo "Starting virtual machine '$domain'..."
+    virsh start "$domain"
+
+    echo "Restoration completed for virtual machine '$domain'."
+}
+
+
+# 主逻辑
+if [ $# -lt 1 ]; then
+    show_help
+    exit 1
+fi
+
+case "$1" in
+    -b|--backup)
+        if [ $# -ne 3 ]; then
+            show_help
+            exit 1
+        fi
+        backup_vm "$2" "$3"
+        ;;
+    -r|--restore)
+        if [ $# -ne 2 ]; then
+            show_help
+            exit 1
+        fi
+        restore_vm "$2"
+        ;;
+    -h|--help)
+        show_help
+        ;;
+    *)
+        show_help
+        exit 1
+        ;;
+esac
+
+exit 0
+
+
